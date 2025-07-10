@@ -1,0 +1,240 @@
+name: Reusable Docker Blue-Green Deployment
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: false
+        default: 'production'
+        type: string
+      container_prefix:
+        description: 'Container name prefix'
+        required: true
+        type: string
+      container_port:
+        description: 'Container port'
+        required: false
+        default: '3000'
+        type: string
+      health_check_timeout:
+        description: 'Health check timeout in seconds'
+        required: false
+        default: '300'
+        type: string
+      notification_enabled:
+        description: 'Enable deployment notifications'
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      CLOUDFLARE_TUNNEL_TOKEN:
+        description: 'Cloudflare tunnel token'
+        required: true
+      EMAIL_USER:
+        description: 'Email user for notifications'
+        required: false
+      EMAIL_PASS:
+        description: 'Email password for notifications'
+        required: false
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+    
+    env:
+      CLOUDFLARED_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      EMAIL_USER: ${{ secrets.EMAIL_USER }}
+      EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+      CONTAINER_PREFIX: ${{ inputs.container_prefix }}
+      CONTAINER_PORT: ${{ inputs.container_port }}
+    
+    outputs:
+      deployment_status: ${{ steps.deployment_result.outputs.status }}
+      deployed_slot: ${{ steps.determine_slots.outputs.deploy_slot }}
+      deployment_time: ${{ steps.deployment_result.outputs.time }}
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: 🐳 Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        install: true
+    
+    - name: 🔧 Setup Docker Compose Cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.docker/cli-plugins/docker-compose
+          /tmp/.buildx-cache
+        key: ${{ runner.os }}-docker-${{ hashFiles('**/docker-compose.yml') }}
+        restore-keys: |
+          ${{ runner.os }}-docker-
+    
+    - name: 📋 Pre-deployment Validation
+      id: validation
+      run: |
+        echo "🔍 Validating deployment environment..."
+        
+        # Check if required files exist
+        if [ ! -f "docker-compose.yml" ]; then
+          echo "❌ docker-compose.yml not found!"
+          exit 1
+        fi
+        
+        # Check if Docker daemon is running
+        if ! docker info >/dev/null 2>&1; then
+          echo "❌ Docker daemon is not running!"
+          exit 1
+        fi
+        
+        echo "✅ Pre-deployment validation passed"
+        echo "validated=true" >> $GITHUB_OUTPUT
+    
+    - name: 🔧 Create Initial Upstream Config
+      run: |
+        if [ ! -f active_upstream.conf ]; then
+          echo "Creating initial active_upstream.conf, pointing to blue..."
+          echo "set \$active_upstream ${{ env.CONTAINER_PREFIX }}-blue:${{ env.CONTAINER_PORT }};" > active_upstream.conf
+        fi
+    
+    - name: 🌐 Ensure Core Infrastructure
+      run: |
+        echo "🚀 Ensuring nginx and cloudflared are running..."
+        docker compose up -d nginx
+        
+        # Enhanced health check with timeout
+        timeout_seconds=60
+        elapsed=0
+        
+        while [ $elapsed -lt $timeout_seconds ]; do
+          HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' portfolio-nginx 2>/dev/null || echo "starting")
+          if [ "${HEALTH_STATUS}" == "healthy" ]; then
+            echo "✅ Nginx is healthy!"
+            docker compose up -d cloudflared
+            break
+          fi
+          echo "⏳ Waiting for Nginx to be healthy... (Status: ${HEALTH_STATUS})"
+          sleep 6
+          elapsed=$((elapsed + 6))
+        done
+        
+        if [ $elapsed -ge $timeout_seconds ]; then
+          echo "❌ Nginx failed to start within timeout. Check logs."
+          docker compose logs nginx
+          exit 1
+        fi
+    
+    - name: 🎯 Determine Deployment Slots
+      id: determine_slots
+      run: |
+        if grep -q "blue" active_upstream.conf; then
+          LIVE_SLOT="blue"
+          DEPLOY_SLOT="green"
+        else
+          LIVE_SLOT="green"
+          DEPLOY_SLOT="blue"
+        fi
+        
+        echo "🔵 Live environment: ${LIVE_SLOT}"
+        echo "🟢 Deploying to: ${DEPLOY_SLOT}"
+        
+        echo "LIVE_SLOT=${LIVE_SLOT}" >> $GITHUB_ENV
+        echo "DEPLOY_SLOT=${DEPLOY_SLOT}" >> $GITHUB_ENV
+        echo "live_slot=${LIVE_SLOT}" >> $GITHUB_OUTPUT
+        echo "deploy_slot=${DEPLOY_SLOT}" >> $GITHUB_OUTPUT
+    
+    - name: 🔨 Build and Deploy New Version
+      run: |
+        echo "🚀 Building and deploying ${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}..."
+        
+        # Build with cache
+        DOCKER_BUILDKIT=1 docker compose build --build-arg BUILDKIT_INLINE_CACHE=1 "${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+        
+        # Deploy the new version
+        docker compose up -d --force-recreate "${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+    
+    - name: 🔍 Wait for New Environment Health
+      run: |
+        CONTAINER_NAME="${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+        timeout_seconds=${{ inputs.health_check_timeout }}
+        elapsed=0
+        
+        echo "🔍 Waiting for ${CONTAINER_NAME} to become healthy..."
+        
+        while [ $elapsed -lt $timeout_seconds ]; do
+          HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${CONTAINER_NAME} 2>/dev/null || echo "starting")
+          if [ "${HEALTH_STATUS}" == "healthy" ]; then
+            echo "✅ ${CONTAINER_NAME} is healthy!"
+            break
+          fi
+          echo "⏳ Waiting... (Status: ${HEALTH_STATUS}) - ${elapsed}s elapsed"
+          sleep 10
+          elapsed=$((elapsed + 10))
+        done
+        
+        if [ $elapsed -ge $timeout_seconds ]; then
+          echo "❌ ${CONTAINER_NAME} failed to become healthy. Aborting."
+          docker compose logs "${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+          exit 1
+        fi
+    
+    - name: 🔄 Switch Traffic (Zero Downtime)
+      run: |
+        echo "🔄 Switching traffic from ${{ env.LIVE_SLOT }} to ${{ env.DEPLOY_SLOT }}..."
+        
+        # Backup current config
+        cp active_upstream.conf active_upstream.conf.backup
+        
+        # Atomically switch the upstream
+        echo "set \$active_upstream ${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}:${{ env.CONTAINER_PORT }};" > active_upstream.conf
+        
+        # Graceful reload
+        echo "🔄 Performing graceful nginx reload..."
+        docker compose exec nginx nginx -s reload
+        echo "✅ Traffic switched successfully!"
+    
+    - name: 🧹 Clean Up Old Environment
+      run: |
+        echo "🛑 Stopping the old ${{ env.LIVE_SLOT }} container..."
+        docker compose stop "${{ env.CONTAINER_PREFIX }}-${{ env.LIVE_SLOT }}" || true
+        
+        # Clean up old images (keep last 2 versions)
+        docker image prune -f --filter "until=72h" || true
+    
+    - name: 📊 Deployment Summary
+      id: deployment_result
+      run: |
+        echo "🎉 Zero-downtime deployment complete!"
+        echo "📈 Deployment Summary:"
+        echo "  • Environment: ${{ inputs.environment }}"
+        echo "  • Deployed Slot: ${{ env.DEPLOY_SLOT }}"
+        echo "  • Previous Slot: ${{ env.LIVE_SLOT }}"
+        echo "  • Container: ${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+        echo "  • Time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+        
+        docker compose ps
+        
+        echo "status=success" >> $GITHUB_OUTPUT
+        echo "time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_OUTPUT
+    
+    - name: 📧 Send Notification
+      if: ${{ inputs.notification_enabled && always() }}
+      run: |
+        if [ "${{ steps.deployment_result.outputs.status }}" = "success" ]; then
+          STATUS_EMOJI="✅"
+          STATUS_TEXT="SUCCESS"
+        else
+          STATUS_EMOJI="❌"
+          STATUS_TEXT="FAILED"
+        fi
+        
+        echo "${STATUS_EMOJI} Deployment ${STATUS_TEXT} for ${{ inputs.environment }}"
+        echo "Slot: ${{ env.DEPLOY_SLOT }}"
+        echo "Time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
