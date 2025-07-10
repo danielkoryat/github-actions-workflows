@@ -97,6 +97,56 @@ jobs:
         echo "✅ Pre-deployment validation passed"
         echo "validated=true" >> $GITHUB_OUTPUT
     
+    - name: 🧹 Clean Up Orphaned Containers (Safe)
+      run: |
+        echo "🧹 Safely cleaning up orphaned containers..."
+        
+        # Only remove containers that are not currently serving traffic
+        # Check which environment is currently active
+        if [ -f active_upstream.conf ]; then
+          if grep -q "blue" active_upstream.conf; then
+            ACTIVE_SLOT="blue"
+            STANDBY_SLOT="green"
+          else
+            ACTIVE_SLOT="green"
+            STANDBY_SLOT="blue"
+          fi
+          
+          echo "🔵 Active slot: ${ACTIVE_SLOT}"
+          echo "🟢 Standby slot: ${STANDBY_SLOT}"
+          
+          # Only remove the standby slot container if it exists and is not healthy
+          STANDBY_CONTAINER="${{ env.CONTAINER_PREFIX }}-${STANDBY_SLOT}"
+          if docker ps -q -f name="${STANDBY_CONTAINER}" | grep -q .; then
+            HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${STANDBY_CONTAINER} 2>/dev/null || echo "none")
+            if [ "${HEALTH_STATUS}" != "healthy" ]; then
+              echo "🛑 Removing unhealthy standby container: ${STANDBY_CONTAINER}"
+              docker rm -f ${STANDBY_CONTAINER} 2>/dev/null || true
+            else
+              echo "✅ Keeping healthy standby container: ${STANDBY_CONTAINER}"
+            fi
+          fi
+        else
+          echo "⚠️ No active_upstream.conf found, performing minimal cleanup"
+          # Only remove containers that are not running or healthy
+          for container in daniel-koryat-portfolio-blue daniel-koryat-portfolio-green; do
+            if docker ps -q -f name="${container}" | grep -q .; then
+              HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${container} 2>/dev/null || echo "none")
+              if [ "${HEALTH_STATUS}" != "healthy" ]; then
+                echo "🛑 Removing unhealthy container: ${container}"
+                docker rm -f ${container} 2>/dev/null || true
+              else
+                echo "✅ Keeping healthy container: ${container}"
+              fi
+            fi
+          done
+        fi
+        
+        # Clean up any dangling containers (not affecting running services)
+        docker container prune -f
+        
+        echo "✅ Safe cleanup completed"
+    
     - name: 🔧 Create Initial Upstream Config
       run: |
         if [ ! -f active_upstream.conf ]; then
@@ -107,7 +157,7 @@ jobs:
     - name: 🌐 Ensure Core Infrastructure
       run: |
         echo "🚀 Ensuring nginx and cloudflared are running..."
-        docker compose up -d nginx
+        docker compose up -d --remove-orphans nginx
         
         # Enhanced health check with timeout
         timeout_seconds=60
@@ -117,7 +167,7 @@ jobs:
           HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' portfolio-nginx 2>/dev/null || echo "starting")
           if [ "${HEALTH_STATUS}" == "healthy" ]; then
             echo "✅ Nginx is healthy!"
-            docker compose up -d cloudflared
+            docker compose up -d --remove-orphans cloudflared
             break
           fi
           echo "⏳ Waiting for Nginx to be healthy... (Status: ${HEALTH_STATUS})"
@@ -150,6 +200,65 @@ jobs:
         echo "live_slot=${LIVE_SLOT}" >> $GITHUB_OUTPUT
         echo "deploy_slot=${DEPLOY_SLOT}" >> $GITHUB_OUTPUT
     
+    - name: 🔍 Validate Live Environment Health
+      run: |
+        LIVE_CONTAINER="${{ env.CONTAINER_PREFIX }}-${{ env.LIVE_SLOT }}"
+        echo "🔍 Validating live environment health: ${LIVE_CONTAINER}"
+        
+        # Check if live container exists and is healthy
+        if ! docker ps -q -f name="${LIVE_CONTAINER}" | grep -q .; then
+          echo "❌ Live container ${LIVE_CONTAINER} is not running!"
+          echo "🚀 Starting live container..."
+          docker compose up -d --remove-orphans "${LIVE_CONTAINER}"
+          
+          # Wait for it to become healthy
+          timeout_seconds=120
+          elapsed=0
+          while [ $elapsed -lt $timeout_seconds ]; do
+            HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${LIVE_CONTAINER} 2>/dev/null || echo "starting")
+            if [ "${HEALTH_STATUS}" == "healthy" ]; then
+              echo "✅ Live container is now healthy!"
+              break
+            fi
+            echo "⏳ Waiting for live container to be healthy... (Status: ${HEALTH_STATUS})"
+            sleep 10
+            elapsed=$((elapsed + 10))
+          done
+          
+          if [ $elapsed -ge $timeout_seconds ]; then
+            echo "❌ Live container failed to become healthy. Aborting deployment."
+            exit 1
+          fi
+        else
+          HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${LIVE_CONTAINER} 2>/dev/null || echo "none")
+          if [ "${HEALTH_STATUS}" != "healthy" ]; then
+            echo "❌ Live container ${LIVE_CONTAINER} is not healthy (Status: ${HEALTH_STATUS})"
+            echo "🔄 Attempting to restart live container..."
+            docker restart ${LIVE_CONTAINER}
+            
+            # Wait for it to become healthy
+            timeout_seconds=120
+            elapsed=0
+            while [ $elapsed -lt $timeout_seconds ]; do
+              HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${LIVE_CONTAINER} 2>/dev/null || echo "starting")
+              if [ "${HEALTH_STATUS}" == "healthy" ]; then
+                echo "✅ Live container is now healthy!"
+                break
+              fi
+              echo "⏳ Waiting for live container to be healthy... (Status: ${HEALTH_STATUS})"
+              sleep 10
+              elapsed=$((elapsed + 10))
+            done
+            
+            if [ $elapsed -ge $timeout_seconds ]; then
+              echo "❌ Live container failed to become healthy. Aborting deployment."
+              exit 1
+            fi
+          else
+            echo "✅ Live container is healthy!"
+          fi
+        fi
+    
     - name: 🔨 Build and Deploy New Version
       run: |
         echo "🚀 Building and deploying ${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}..."
@@ -157,8 +266,8 @@ jobs:
         # Build with cache
         DOCKER_BUILDKIT=1 docker compose build --build-arg BUILDKIT_INLINE_CACHE=1 "${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
         
-        # Deploy the new version
-        docker compose up -d --force-recreate "${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+        # Deploy the new version with orphan removal
+        docker compose up -d --force-recreate --remove-orphans "${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
     
     - name: 🔍 Wait for New Environment Health
       run: |
@@ -192,13 +301,39 @@ jobs:
         # Backup current config
         cp active_upstream.conf active_upstream.conf.backup
         
-        # Atomically switch the upstream
-        echo "set \$active_upstream ${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}:${{ env.CONTAINER_PORT }};" > active_upstream.conf
+        # Create a temporary config with both upstreams for smooth transition
+        echo "set \$active_upstream ${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}:${{ env.CONTAINER_PORT }};" > active_upstream.conf.tmp
+        echo "set \$backup_upstream ${{ env.CONTAINER_PREFIX }}-${{ env.LIVE_SLOT }}:${{ env.CONTAINER_PORT }};" >> active_upstream.conf.tmp
         
-        # Graceful reload
-        echo "🔄 Performing graceful nginx reload..."
+        # Atomically switch the upstream
+        mv active_upstream.conf.tmp active_upstream.conf
+        
+        # Perform graceful nginx reload with connection draining
+        echo "🔄 Performing graceful nginx reload with connection draining..."
+        
+        # Send SIGUSR1 to nginx for graceful reload (drains existing connections)
         docker compose exec nginx nginx -s reload
-        echo "✅ Traffic switched successfully!"
+        
+        # Wait a moment for connections to drain
+        echo "⏳ Waiting for connections to drain..."
+        sleep 5
+        
+        # Verify the new environment is still healthy after traffic switch
+        NEW_CONTAINER="${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+        HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${NEW_CONTAINER} 2>/dev/null || echo "none")
+        
+        if [ "${HEALTH_STATUS}" == "healthy" ]; then
+          echo "✅ Traffic switched successfully! New environment is healthy."
+        else
+          echo "❌ New environment is not healthy after traffic switch. Rolling back..."
+          
+          # Rollback to previous configuration
+          mv active_upstream.conf.backup active_upstream.conf
+          docker compose exec nginx nginx -s reload
+          
+          echo "❌ Deployment failed - rolled back to previous environment"
+          exit 1
+        fi
     
     - name: 🧹 Clean Up Old Environment
       run: |
@@ -207,6 +342,37 @@ jobs:
         
         # Clean up old images (keep last 2 versions)
         docker image prune -f --filter "until=72h" || true
+    
+    - name: 🔍 Final Deployment Validation
+      run: |
+        echo "🔍 Performing final deployment validation..."
+        
+        # Verify the new environment is still healthy
+        NEW_CONTAINER="${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+        HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${NEW_CONTAINER} 2>/dev/null || echo "none")
+        
+        if [ "${HEALTH_STATUS}" != "healthy" ]; then
+          echo "❌ Final validation failed - new environment is not healthy"
+          echo "🔄 Rolling back to previous environment..."
+          
+          # Rollback to previous configuration
+          if [ -f active_upstream.conf.backup ]; then
+            mv active_upstream.conf.backup active_upstream.conf
+            docker compose exec nginx nginx -s reload
+            echo "✅ Rollback completed"
+          fi
+          
+          exit 1
+        fi
+        
+        # Verify nginx is serving traffic correctly
+        NGINX_STATUS=$(docker inspect --format '{{.State.Health.Status}}' portfolio-nginx 2>/dev/null || echo "none")
+        if [ "${NGINX_STATUS}" != "healthy" ]; then
+          echo "❌ Final validation failed - nginx is not healthy"
+          exit 1
+        fi
+        
+        echo "✅ Final validation passed - deployment successful!"
     
     - name: 📊 Deployment Summary
       id: deployment_result
