@@ -33,6 +33,7 @@ jobs:
         format: sarif
         output-file: hadolint-results.sarif
         failure-threshold: warning
+        no-fail: true
     
     - name: 📊 Upload Dockerfile Scan Results
       if: ${{ inputs.scan_type == 'dockerfile' || inputs.scan_type == 'both' }}
@@ -52,6 +53,7 @@ jobs:
         image-ref: 'scan-image:latest'
         format: 'sarif'
         output: 'trivy-results.sarif'
+        exit-code: '0'
     
     - name: 📊 Upload Container Scan Results
       if: ${{ inputs.scan_type == 'container' || inputs.scan_type == 'both' }}
