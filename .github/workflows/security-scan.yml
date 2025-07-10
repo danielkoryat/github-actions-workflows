@@ -1,0 +1,59 @@
+name: Reusable Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      scan_type:
+        description: 'Type of security scan (dockerfile, container, or both)'
+        required: false
+        default: 'both'
+        type: string
+      fail_on_critical:
+        description: 'Fail workflow on critical vulnerabilities'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: 🔍 Scan Dockerfile
+      if: ${{ inputs.scan_type == 'dockerfile' || inputs.scan_type == 'both' }}
+      uses: hadolint/hadolint-action@v3.1.0
+      with:
+        dockerfile: Dockerfile
+        format: sarif
+        output-file: hadolint-results.sarif
+    
+    - name: 📊 Upload Dockerfile Scan Results
+      if: ${{ inputs.scan_type == 'dockerfile' || inputs.scan_type == 'both' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: hadolint-results.sarif
+    
+    - name: 🐳 Build Image for Scanning
+      if: ${{ inputs.scan_type == 'container' || inputs.scan_type == 'both' }}
+      run: |
+        docker build -t scan-image:latest .
+    
+    - name: 🛡️ Run Container Security Scan
+      if: ${{ inputs.scan_type == 'container' || inputs.scan_type == 'both' }}
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'scan-image:latest'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+    
+    - name: 📊 Upload Container Scan Results
+      if: ${{ inputs.scan_type == 'container' || inputs.scan_type == 'both' }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: trivy-results.sarif
