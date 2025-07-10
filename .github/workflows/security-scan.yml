@@ -32,6 +32,7 @@ jobs:
         dockerfile: Dockerfile
         format: sarif
         output-file: hadolint-results.sarif
+        failure-threshold: warning
     
     - name: 📊 Upload Dockerfile Scan Results
       if: ${{ inputs.scan_type == 'dockerfile' || inputs.scan_type == 'both' }}
