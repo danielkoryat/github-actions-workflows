@@ -121,10 +121,39 @@ jobs:
     
     - name: 🌐 Ensure Core Infrastructure
       run: |
-        echo "🚀 Ensuring nginx and cloudflared are running..."
+        echo "🚀 Deploying portfolio service first..."
+        
+        # Build and deploy the portfolio service first
+        DOCKER_BUILDKIT=1 docker compose build --build-arg BUILDKIT_INLINE_CACHE=1 portfolio
+        docker compose up -d --force-recreate portfolio
+        
+        # Wait for portfolio to be healthy
+        echo "⏳ Waiting for portfolio service to be healthy..."
+        timeout_seconds=120
+        elapsed=0
+        
+        while [ $elapsed -lt $timeout_seconds ]; do
+          HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' daniel-koryat-portfolio 2>/dev/null || echo "starting")
+          if [ "${HEALTH_STATUS}" == "healthy" ]; then
+            echo "✅ Portfolio service is healthy!"
+            break
+          fi
+          echo "⏳ Waiting for portfolio service... (Status: ${HEALTH_STATUS})"
+          sleep 10
+          elapsed=$((elapsed + 10))
+        done
+        
+        if [ $elapsed -ge $timeout_seconds ]; then
+          echo "❌ Portfolio service failed to start within timeout. Check logs."
+          docker compose logs portfolio
+          exit 1
+        fi
+        
+        # Now start nginx after portfolio is healthy
+        echo "🚀 Starting nginx after portfolio is ready..."
         docker compose up -d --remove-orphans nginx
         
-        # Enhanced health check with timeout
+        # Wait for nginx to be healthy
         timeout_seconds=60
         elapsed=0
         
@@ -176,43 +205,29 @@ jobs:
           echo "ℹ️ No existing container found - will deploy new one"
         fi
     
-    - name: 🔨 Build and Deploy New Version
+    - name: 🔍 Verify All Services Health
       run: |
+        echo "🔍 Verifying all services are healthy..."
+        
+        # Verify portfolio service is healthy
         CONTAINER_NAME="${{ env.CONTAINER_PREFIX }}"
-        echo "🚀 Building and deploying ${CONTAINER_NAME}..."
+        HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${CONTAINER_NAME} 2>/dev/null || echo "none")
         
-        # Build with cache
-        DOCKER_BUILDKIT=1 docker compose build --build-arg BUILDKIT_INLINE_CACHE=1 portfolio
-        
-        # Deploy the new version with orphan removal
-        docker compose up -d --force-recreate --remove-orphans portfolio
-        
-        echo "✅ New version deployed to ${CONTAINER_NAME}"
-    
-    - name: 🔍 Wait for New Environment Health
-      run: |
-        CONTAINER_NAME="${{ env.CONTAINER_PREFIX }}"
-        timeout_seconds=${{ inputs.health_check_timeout }}
-        elapsed=0
-        
-        echo "🔍 Waiting for ${CONTAINER_NAME} to become healthy..."
-        
-        while [ $elapsed -lt $timeout_seconds ]; do
-          HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${CONTAINER_NAME} 2>/dev/null || echo "starting")
-          if [ "${HEALTH_STATUS}" == "healthy" ]; then
-            echo "✅ ${CONTAINER_NAME} is healthy!"
-            break
-          fi
-          echo "⏳ Waiting... (Status: ${HEALTH_STATUS}) - ${elapsed}s elapsed"
-          sleep 10
-          elapsed=$((elapsed + 10))
-        done
-        
-        if [ $elapsed -ge $timeout_seconds ]; then
-          echo "❌ ${CONTAINER_NAME} failed to become healthy. Aborting."
+        if [ "${HEALTH_STATUS}" != "healthy" ]; then
+          echo "❌ Portfolio service is not healthy (Status: ${HEALTH_STATUS})"
           docker compose logs portfolio
           exit 1
         fi
+        
+        # Verify nginx is healthy
+        NGINX_STATUS=$(docker inspect --format '{{.State.Health.Status}}' portfolio-nginx 2>/dev/null || echo "none")
+        if [ "${NGINX_STATUS}" != "healthy" ]; then
+          echo "❌ Nginx is not healthy (Status: ${NGINX_STATUS})"
+          docker compose logs nginx
+          exit 1
+        fi
+        
+        echo "✅ All services are healthy!"
     
     - name: 🔄 Verify Deployment Success
       run: |
