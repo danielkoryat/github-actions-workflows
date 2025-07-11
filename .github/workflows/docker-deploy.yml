@@ -120,8 +120,8 @@ jobs:
         echo "🛑 Removing target container: ${TARGET_CONTAINER}"
         docker rm -f "${TARGET_CONTAINER}" 2>/dev/null || true
         
-        # Clean up only dangling containers (not affecting running services)
-        docker container prune -f --filter "label=com.docker.compose.project=personal-website" || true
+        # REMOVED: Dangerous container prune command that was removing live containers
+        # We'll only remove what we explicitly want to remove
         
         # Verify live container is still running after cleanup
         if ! docker ps -q -f name="${LIVE_CONTAINER}" | grep -q .; then
