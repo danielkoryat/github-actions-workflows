@@ -101,51 +101,15 @@ jobs:
       run: |
         echo "🧹 Safely cleaning up orphaned containers..."
         
-        # Only remove containers that are not currently serving traffic
-        # Check which environment is currently active
-        if [ -f active_upstream.conf ]; then
-          if grep -q "blue" active_upstream.conf; then
-            ACTIVE_SLOT="blue"
-            STANDBY_SLOT="green"
-          else
-            ACTIVE_SLOT="green"
-            STANDBY_SLOT="blue"
-          fi
-          
-          echo "🔵 Active slot: ${ACTIVE_SLOT}"
-          echo "🟢 Standby slot: ${STANDBY_SLOT}"
-          
-          # Only remove the standby slot container if it exists and is not healthy
-          STANDBY_CONTAINER="${{ env.CONTAINER_PREFIX }}-${STANDBY_SLOT}"
-          if docker ps -q -f name="${STANDBY_CONTAINER}" | grep -q .; then
-            HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${STANDBY_CONTAINER} 2>/dev/null || echo "none")
-            if [ "${HEALTH_STATUS}" != "healthy" ]; then
-              echo "🛑 Removing unhealthy standby container: ${STANDBY_CONTAINER}"
-              docker rm -f ${STANDBY_CONTAINER} 2>/dev/null || true
-            else
-              echo "✅ Keeping healthy standby container: ${STANDBY_CONTAINER}"
-            fi
-          fi
-        else
-          echo "⚠️ No active_upstream.conf found, performing minimal cleanup"
-          # Only remove containers that are not running or healthy
-          for container in daniel-koryat-portfolio-blue daniel-koryat-portfolio-green; do
-            if docker ps -q -f name="${container}" | grep -q .; then
-              HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${container} 2>/dev/null || echo "none")
-              if [ "${HEALTH_STATUS}" != "healthy" ]; then
-                echo "🛑 Removing unhealthy container: ${container}"
-                docker rm -f ${container} 2>/dev/null || true
-              else
-                echo "✅ Keeping healthy container: ${container}"
-              fi
-            fi
-          done
-        fi
+        # Force remove any existing containers with the same names to prevent conflicts
+        echo "🛑 Force removing any existing containers to prevent name conflicts..."
+        docker rm -f "${{ env.CONTAINER_PREFIX }}-blue" 2>/dev/null || true
+        docker rm -f "${{ env.CONTAINER_PREFIX }}-green" 2>/dev/null || true
         
         # Clean up any dangling containers (not affecting running services)
         docker container prune -f
         
-        echo "✅ Safe cleanup completed"
+        echo "✅ Container cleanup completed"
     
     - name: 🔧 Create Initial Upstream Config
       run: |
