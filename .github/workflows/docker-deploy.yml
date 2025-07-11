@@ -97,19 +97,44 @@ jobs:
         echo "✅ Pre-deployment validation passed"
         echo "validated=true" >> $GITHUB_OUTPUT
     
-    - name: 🧹 Clean Up Orphaned Containers (Safe)
+    - name: 🧹 Clean Up Target Container Only (Zero Downtime)
       run: |
-        echo "🧹 Safely cleaning up orphaned containers..."
+        echo "🧹 Preparing deployment slot..."
         
-        # Force remove any existing containers with the same names to prevent conflicts
-        echo "🛑 Force removing any existing containers to prevent name conflicts..."
-        docker rm -f "${{ env.CONTAINER_PREFIX }}-blue" 2>/dev/null || true
-        docker rm -f "${{ env.CONTAINER_PREFIX }}-green" 2>/dev/null || true
+        # Determine which slot we're deploying to
+        if grep -q "blue" active_upstream.conf; then
+          TARGET_SLOT="green"
+          LIVE_SLOT="blue"
+        else
+          TARGET_SLOT="blue"
+          LIVE_SLOT="green"
+        fi
         
-        # Clean up any dangling containers (not affecting running services)
-        docker container prune -f
+        TARGET_CONTAINER="${{ env.CONTAINER_PREFIX }}-${TARGET_SLOT}"
+        LIVE_CONTAINER="${{ env.CONTAINER_PREFIX }}-${LIVE_SLOT}"
         
-        echo "✅ Container cleanup completed"
+        echo "🟢 Live container: ${LIVE_CONTAINER}"
+        echo "🎯 Target container: ${TARGET_CONTAINER}"
+        
+        # Only remove the target container (not the live one!)
+        echo "🛑 Removing target container: ${TARGET_CONTAINER}"
+        docker rm -f "${TARGET_CONTAINER}" 2>/dev/null || true
+        
+        # Clean up only dangling containers (not affecting running services)
+        docker container prune -f --filter "label=com.docker.compose.project=personal-website" || true
+        
+        # Verify live container is still running after cleanup
+        if ! docker ps -q -f name="${LIVE_CONTAINER}" | grep -q .; then
+          echo "❌ CRITICAL: Live container ${LIVE_CONTAINER} disappeared during cleanup!"
+          echo "This indicates a serious issue with the deployment logic."
+          exit 1
+        fi
+        
+        # Export slots for later steps
+        echo "TARGET_SLOT=${TARGET_SLOT}" >> $GITHUB_ENV
+        echo "LIVE_SLOT=${LIVE_SLOT}" >> $GITHUB_ENV
+        
+        echo "✅ Target container cleanup completed - live container preserved"
     
     - name: 🔧 Create Initial Upstream Config
       run: |
@@ -145,34 +170,27 @@ jobs:
           exit 1
         fi
     
-    - name: 🎯 Determine Deployment Slots
+    - name: 🎯 Confirm Deployment Slots
       id: determine_slots
       run: |
-        if grep -q "blue" active_upstream.conf; then
-          LIVE_SLOT="blue"
-          DEPLOY_SLOT="green"
-        else
-          LIVE_SLOT="green"
-          DEPLOY_SLOT="blue"
-        fi
-        
+        # Slots were already determined in the cleanup step
         echo "🔵 Live environment: ${LIVE_SLOT}"
-        echo "🟢 Deploying to: ${DEPLOY_SLOT}"
+        echo "🟢 Deploying to: ${TARGET_SLOT}"
         
-        echo "LIVE_SLOT=${LIVE_SLOT}" >> $GITHUB_ENV
-        echo "DEPLOY_SLOT=${DEPLOY_SLOT}" >> $GITHUB_ENV
+        # Set DEPLOY_SLOT for consistency with existing code
+        echo "DEPLOY_SLOT=${TARGET_SLOT}" >> $GITHUB_ENV
         echo "live_slot=${LIVE_SLOT}" >> $GITHUB_OUTPUT
-        echo "deploy_slot=${DEPLOY_SLOT}" >> $GITHUB_OUTPUT
+        echo "deploy_slot=${TARGET_SLOT}" >> $GITHUB_OUTPUT
     
     - name: 🔍 Validate Live Environment Health
       run: |
         LIVE_CONTAINER="${{ env.CONTAINER_PREFIX }}-${{ env.LIVE_SLOT }}"
         echo "🔍 Validating live environment health: ${LIVE_CONTAINER}"
         
-        # Check if live container exists and is healthy
+        # Check if live container exists and is running
         if ! docker ps -q -f name="${LIVE_CONTAINER}" | grep -q .; then
           echo "❌ Live container ${LIVE_CONTAINER} is not running!"
-          echo "🚀 Starting live container..."
+          echo "🚀 Starting live container (this should not happen in a proper blue-green deployment)..."
           docker compose up -d --remove-orphans "${LIVE_CONTAINER}"
           
           # Wait for it to become healthy
@@ -194,9 +212,10 @@ jobs:
             exit 1
           fi
         else
+          # Container is running, check health status
           HEALTH_STATUS=$(docker inspect --format '{{.State.Health.Status}}' ${LIVE_CONTAINER} 2>/dev/null || echo "none")
           if [ "${HEALTH_STATUS}" != "healthy" ]; then
-            echo "❌ Live container ${LIVE_CONTAINER} is not healthy (Status: ${HEALTH_STATUS})"
+            echo "⚠️ Live container ${LIVE_CONTAINER} is not healthy (Status: ${HEALTH_STATUS})"
             echo "🔄 Attempting to restart live container..."
             docker restart ${LIVE_CONTAINER}
             
@@ -219,19 +238,22 @@ jobs:
               exit 1
             fi
           else
-            echo "✅ Live container is healthy!"
+            echo "✅ Live container is healthy and serving traffic!"
           fi
         fi
     
     - name: 🔨 Build and Deploy New Version
       run: |
-        echo "🚀 Building and deploying ${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}..."
+        TARGET_CONTAINER="${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+        echo "🚀 Building and deploying ${TARGET_CONTAINER}..."
         
         # Build with cache
         DOCKER_BUILDKIT=1 docker compose build --build-arg BUILDKIT_INLINE_CACHE=1 "${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
         
         # Deploy the new version with orphan removal
         docker compose up -d --force-recreate --remove-orphans "${{ env.CONTAINER_PREFIX }}-${{ env.DEPLOY_SLOT }}"
+        
+        echo "✅ New version deployed to ${TARGET_CONTAINER}"
     
     - name: 🔍 Wait for New Environment Health
       run: |
