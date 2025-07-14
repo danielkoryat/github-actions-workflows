@@ -28,9 +28,6 @@ on:
         default: true
         type: boolean
     secrets:
-      CLOUDFLARE_TUNNEL_TOKEN:
-        description: 'Cloudflare tunnel token'
-        required: true
       EMAIL_USER:
         description: 'Email user for notifications'
         required: false
